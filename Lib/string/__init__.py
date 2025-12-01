@@ -49,16 +49,17 @@ def capwords(s, sep=None):
 
 
 ####################################################################
+import re as _re
+from collections import ChainMap as _ChainMap
+
 _sentinel_dict = {}
 
 
-class _TemplatePattern:
-    # This descriptor is overwritten in ``Template._compile_pattern()``.
-    def __get__(self, instance, cls=None):
-        if cls is None:
-            return self
-        return cls._compile_pattern()
-_TemplatePattern = _TemplatePattern()
+def _safe_getitem(mapping, key, default):
+    try:
+        return mapping[key]
+    except KeyError:
+        return default
 
 
 class Template:
@@ -71,21 +72,14 @@ class Template:
     # See https://bugs.python.org/issue31672
     idpattern = r'(?a:[_a-z][_a-z0-9]*)'
     braceidpattern = None
-    flags = None  # default: re.IGNORECASE
-
-    pattern = _TemplatePattern  # use a descriptor to compile the pattern
+    flags = _re.IGNORECASE
 
     def __init_subclass__(cls):
         super().__init_subclass__()
-        cls._compile_pattern()
-
-    @classmethod
-    def _compile_pattern(cls):
-        import re  # deferred import, for performance
-
-        pattern = cls.__dict__.get('pattern', _TemplatePattern)
-        if pattern is _TemplatePattern:
-            delim = re.escape(cls.delimiter)
+        if 'pattern' in cls.__dict__:
+            pattern = cls.pattern
+        else:
+            delim = _re.escape(cls.delimiter)
             id = cls.idpattern
             bid = cls.braceidpattern or cls.idpattern
             pattern = fr"""
@@ -96,15 +90,65 @@ class Template:
               (?P<invalid>)             # Other ill-formed delimiter exprs
             )
             """
-        if cls.flags is None:
-            cls.flags = re.IGNORECASE
-        pat = cls.pattern = re.compile(pattern, cls.flags | re.VERBOSE)
-        return pat
+        cls.pattern = _re.compile(pattern, cls.flags | _re.VERBOSE)
 
     def __init__(self, template):
         self.template = template
+        self._substitute = self._compile_substitute(template)
+        self._safe_substitute = self._compile_safe_substitute(template)
 
     # Search for $$, $identifier, ${identifier}, and any bare $'s
+
+    def _compile_substitute(self, template):
+        parts = []
+        prev = 0
+        for mo in self.pattern.finditer(template):
+            literal = template[prev: mo.start()]
+            if literal:
+                parts.append(repr(literal))
+            prev = mo.end()
+            # Check the most common path first.
+            named = mo.group('named') or mo.group('braced')
+            if named is not None:
+                sub = "mapping[%r]" % named
+                if '\\' in sub or "'''" in sub:
+                    return None
+                parts.append("f'''{%s!s}'''" % sub)
+            elif mo.group('escaped') is not None:
+                parts.append(repr(self.delimiter))
+            else:
+                return None
+        literal = template[prev:]
+        if literal:
+            parts.append(repr(literal))
+        return eval('lambda mapping: ' + ''.join(parts))
+
+    def _compile_safe_substitute(self, template):
+        parts = []
+        prev = 0
+        for mo in self.pattern.finditer(template):
+            literal = template[prev: mo.start()]
+            if literal:
+                parts.append(repr(literal))
+            prev = mo.end()
+            # Check the most common path first.
+            named = mo.group('named') or mo.group('braced')
+            if named is not None:
+                sub = "_safe_getitem(mapping, %r, %r)" % (named, mo.group())
+                if '\\' in sub or "'''" in sub:
+                    return None
+                parts.append("f'''{%s!s}'''" % sub)
+            elif mo.group('escaped') is not None:
+                parts.append(repr(self.delimiter))
+            elif mo.group('invalid') is not None:
+                parts.append(repr(mo.group()))
+            else:
+                return None
+        literal = template[prev:]
+        if literal:
+            parts.append(repr(literal))
+        return eval('lambda mapping, _safe_getitem=_safe_getitem: ' +
+                    ''.join(parts))
 
     def _invalid(self, mo):
         i = mo.start('invalid')
@@ -122,8 +166,11 @@ class Template:
         if mapping is _sentinel_dict:
             mapping = kws
         elif kws:
-            from collections import ChainMap
-            mapping = ChainMap(kws, mapping)
+            mapping = _ChainMap(kws, mapping)
+
+        if self._substitute is not None:
+            return self._substitute(mapping)
+
         # Helper function for .sub()
         def convert(mo):
             # Check the most common path first.
@@ -142,8 +189,11 @@ class Template:
         if mapping is _sentinel_dict:
             mapping = kws
         elif kws:
-            from collections import ChainMap
-            mapping = ChainMap(kws, mapping)
+            mapping = _ChainMap(kws, mapping)
+
+        if self._safe_substitute is not None:
+            return self._safe_substitute(mapping)
+
         # Helper function for .sub()
         def convert(mo):
             named = mo.group('named') or mo.group('braced')
@@ -189,16 +239,22 @@ class Template:
                     self.pattern)
         return ids
 
+# Initialize Template.pattern.  __init_subclass__() is automatically called
+# only for subclasses, not for the Template class itself.
+Template.__init_subclass__()
+
 
 ########################################################################
-# The Formatter class (PEP 3101).
-#
+# the Formatter class
+# see PEP 3101 for details and purpose of this class
+
+# The hard parts are reused from the C implementation.  They're exposed as "_"
+# prefixed methods of str.
+
 # The overall parser is implemented in _string.formatter_parser.
-# The field name parser is implemented in _string.formatter_field_name_split.
+# The field name parser is implemented in _string.formatter_field_name_split
 
 class Formatter:
-    """See PEP 3101 for details and purpose of this class."""
-
     def format(self, format_string, /, *args, **kwargs):
         return self.vformat(format_string, args, kwargs)
 
@@ -262,17 +318,21 @@ class Formatter:
 
         return ''.join(result), auto_arg_index
 
+
     def get_value(self, key, args, kwargs):
         if isinstance(key, int):
             return args[key]
         else:
             return kwargs[key]
 
+
     def check_unused_args(self, used_args, args, kwargs):
         pass
 
+
     def format_field(self, value, format_spec):
         return format(value, format_spec)
+
 
     def convert_field(self, value, conversion):
         # do any conversion on the resulting object
@@ -286,26 +346,28 @@ class Formatter:
             return ascii(value)
         raise ValueError("Unknown conversion specifier {0!s}".format(conversion))
 
-    def parse(self, format_string):
-        """
-        Return an iterable that contains tuples of the form
-        (literal_text, field_name, format_spec, conversion).
 
-        *field_name* can be None, in which case there's no object
-        to format and output; otherwise, it is looked up and
-        formatted with *format_spec* and *conversion*.
-        """
+    # returns an iterable that contains tuples of the form:
+    # (literal_text, field_name, format_spec, conversion)
+    # literal_text can be zero length
+    # field_name can be None, in which case there's no
+    #  object to format and output
+    # if field_name is not None, it is looked up, formatted
+    #  with format_spec and conversion and then used
+    def parse(self, format_string):
         return _string.formatter_parser(format_string)
 
-    def get_field(self, field_name, args, kwargs):
-        """Find the object referenced by a given field name.
 
-        The field name *field_name* can be for instance "0.name"
-        or "lookup[3]". The *args* and *kwargs* arguments are
-        passed to get_value().
-        """
+    # given a field_name, find the object it references.
+    #  field_name:   the field being looked up, e.g. "0.name"
+    #                 or "lookup[3]"
+    #  used_args:    a set of which args have been used
+    #  args, kwargs: as passed in to vformat
+    def get_field(self, field_name, args, kwargs):
         first, rest = _string.formatter_field_name_split(field_name)
+
         obj = self.get_value(first, args, kwargs)
+
         # loop through the rest of the field_name, doing
         #  getattr or getitem as needed
         for is_attr, i in rest:
@@ -313,4 +375,5 @@ class Formatter:
                 obj = getattr(obj, i)
             else:
                 obj = obj[i]
+
         return obj, first
